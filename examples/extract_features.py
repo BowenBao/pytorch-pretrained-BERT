@@ -216,8 +216,12 @@ def main():
     args = parser.parse_args()
 
     if args.local_rank == -1 or args.no_cuda:
-        device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
-        n_gpu = torch.cuda.device_count()
+        # device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
+        # n_gpu = torch.cuda.device_count()
+
+        # debugging, use cpu only
+        device = torch.device('cpu')
+        n_gpu = 1
     else:
         device = torch.device("cuda", args.local_rank)
         n_gpu = 1
@@ -264,7 +268,32 @@ def main():
             input_ids = input_ids.to(device)
             input_mask = input_mask.to(device)
 
-            all_encoder_layers, _ = model(input_ids, token_type_ids=None, attention_mask=input_mask)
+            """
+            using time.perf_counter
+            """
+            import time
+            perf_time = time.perf_counter()
+            all_encoder_layers, qe = model(input_ids, token_type_ids=None, attention_mask=input_mask)
+            perf_time = time.perf_counter() - perf_time
+            print('time: ', perf_time)
+
+            """
+            using profiler
+            """
+            with torch.autograd.profiler.profile() as prof:
+                all_encoder_layers, qe = model(input_ids, token_type_ids=None, attention_mask=input_mask)
+            print(prof)
+
+            break
+
+            """
+            export to onnx
+            """
+            # onnx_helper.Save('../exported', 'bert_pretrained', model, [input_ids, torch.zeros(128, dtype=torch.long), input_mask], [all_encoder_layers, qe],
+            #     ['input1', 'input2', 'input3'],
+            #     ['output1', 'output2', 'output3', 'output4', 'output5', 'output6', 'output7', 'output8', 'output9', 'output10', 'output11', 'output12', 'output13'])
+
+
             all_encoder_layers = all_encoder_layers
 
             for b, example_index in enumerate(example_indices):
