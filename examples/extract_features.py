@@ -268,31 +268,33 @@ def main():
             input_ids = input_ids.to(device)
             input_mask = input_mask.to(device)
 
-            """
-            using time.perf_counter
-            """
-            import time
-            perf_time = time.perf_counter()
+            # """
+            # using time.perf_counter
+            # """
+            # import time
+            # perf_time = time.perf_counter()
             all_encoder_layers, qe = model(input_ids, token_type_ids=None, attention_mask=input_mask)
-            perf_time = time.perf_counter() - perf_time
-            print('time: ', perf_time)
+            # perf_time = time.perf_counter() - perf_time
+            # print('time: ', perf_time)
 
-            """
-            using profiler
-            """
-            with torch.autograd.profiler.profile() as prof:
-                all_encoder_layers, qe = model(input_ids, token_type_ids=None, attention_mask=input_mask)
-            print(prof)
+            # """
+            # using profiler
+            # """
+            # with torch.autograd.profiler.profile() as prof:
+            #     all_encoder_layers, qe = model(input_ids, token_type_ids=None, attention_mask=input_mask)
+            # print(prof)
 
-            break
+            # break
 
             """
             export to onnx
             """
-            # onnx_helper.Save('../exported', 'bert_pretrained', model, [input_ids, torch.zeros(128, dtype=torch.long), input_mask], [all_encoder_layers, qe],
-            #     ['input1', 'input2', 'input3'],
-            #     ['output1', 'output2', 'output3', 'output4', 'output5', 'output6', 'output7', 'output8', 'output9', 'output10', 'output11', 'output12', 'output13'])
+            import onnx_helper
+            onnx_helper.Save('../exported', 'bert_pretrained', model, [input_ids, torch.zeros(128, dtype=torch.long), input_mask], [all_encoder_layers, qe],
+                ['input1', 'input2', 'input3'],
+                ['output1', 'output2', 'output3', 'output4', 'output5', 'output6', 'output7', 'output8', 'output9', 'output10', 'output11', 'output12', 'output13'])
 
+            break
 
             all_encoder_layers = all_encoder_layers
 
