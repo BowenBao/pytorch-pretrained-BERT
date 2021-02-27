@@ -257,6 +257,13 @@ class Trainer:
         # force device and distributed setup init explicitly
         args._setup_devices
 
+        self.use_ortmodule = False
+        self.ort_session = None
+        self.onnx_large_model = args.onnx_large_model
+
+        if args.ortmodule:
+            self.use_ortmodule = True
+
         if model is None:
             if model_init is not None:
                 self.model_init = model_init
@@ -375,6 +382,7 @@ class Trainer:
         self.use_apex = False
         self.use_amp = False
         self.fp16_backend = None
+
 
         if args.fp16:
             if args.fp16_backend == "auto":
@@ -1455,6 +1463,52 @@ class Trainer:
             labels = inputs.pop("labels")
         else:
             labels = None
+
+        if self.use_ortmodule:
+            if self.ort_session is None:
+                with torch.no_grad():
+                    # TODO: determine input name order
+                    input_names = ['input_ids', 'attention_mask', 'decoder_input_ids', 'labels']
+                    onnx_model_path = 'models/model.onnx'
+                    import io
+                    f = io.BytesIO()
+                    model.eval()
+                    torch.onnx.export(model,
+                                    (inputs,),
+                                    onnx_model_path if self.onnx_large_model else f,
+                                    opset_version=12,
+                                    do_constant_folding=False,
+                                    input_names=input_names,
+                                    training=torch.onnx.TrainingMode.EVAL,
+                                    use_external_data_format=self.onnx_large_model)
+
+                    import onnxruntime
+                    ort_sess = onnxruntime.InferenceSession(onnx_model_path if self.onnx_large_model else f.getvalue())
+                    ort_inputs = {k:inputs[k].detach().cpu().numpy() for k in input_names}
+                    ort_outputs = ort_sess.run(None, ort_inputs)
+
+                    outputs = model(**inputs)
+
+                    # NOTE: flatten output for comparison
+                    outputs_flatten = []
+                    outputs_flatten.append(outputs['loss'])
+                    outputs_flatten.append(outputs['logits'])
+                    for ts in outputs['past_key_values']:
+                        for t in ts:
+                            outputs_flatten.append(t)
+                    outputs_flatten.append(outputs['encoder_last_hidden_state'])
+
+                    import numpy as np
+                    comp_results = [np.allclose(o1.detach().cpu().numpy(), o2, atol=1e-3, rtol=1e-3) for o1, o2 in zip(outputs_flatten, ort_outputs)]
+                    print(outputs_flatten[4], ort_outputs[4])
+                    print(outputs_flatten[5], ort_outputs[5])
+                    print('Compare results between PT and ORT: ', comp_results)
+                    [np.testing.assert_allclose(o1.detach().cpu().numpy(), o2, atol=1e-3, rtol=1e-3) for o1, o2 in zip(outputs_flatten, ort_outputs)]
+                    import sys
+                    sys.exit()
+
+                    model.train()
+
         outputs = model(**inputs)
         # Save past state if it exists
         # TODO: this needs to be fixed and made cleaner later.

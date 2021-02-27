@@ -480,6 +480,14 @@ class TrainingArguments:
         default=None,
         metadata={"help": "Enable deepspeed and pass the path to deepspeed json config file (e.g. ds_config.json)"},
     )
+    ortmodule: bool = field(
+        default=False,
+        metadata={"help": "Enable ORTModule for training backend."}
+    )
+    onnx_large_model: bool = field(
+        default=False,
+        metadata={"help": "Enable ONNX export for large model with external data format."}
+    )
     label_smoothing_factor: float = field(
         default=0.0, metadata={"help": "The label smoothing epsilon to apply (zero means no label smoothing)."}
     )
