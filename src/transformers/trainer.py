@@ -1473,8 +1473,11 @@ class Trainer:
                     import io
                     f = io.BytesIO()
                     model.eval()
+                    from .tokenization_utils import BatchEncoding
+                    if isinstance(inputs, BatchEncoding):
+                        ex_inputs = inputs.data
                     torch.onnx.export(model,
-                                    (inputs,),
+                                    (ex_inputs,),
                                     onnx_model_path if self.onnx_large_model else f,
                                     opset_version=12,
                                     do_constant_folding=False,

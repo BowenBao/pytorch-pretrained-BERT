@@ -167,19 +167,35 @@ def softmax(hidden_state, dim, onnx_trace=False):
         return F.softmax(hidden_state, dim=dim, dtype=torch.float32)
 
 
-def ngram_attention_bias(sequence_length, ngram, device, dtype):
+# def ngram_attention_bias(sequence_length, ngram, device, dtype):
+#     """
+#     This function computes the bias for the predict stream
+#     """
+#     left_block = torch.ones((ngram, sequence_length, sequence_length), device=device, dtype=dtype) * float("-inf")
+#     right_block = left_block.detach().clone()
+#     # create bias
+#     for stream_idx in range(ngram):
+#         right_block[stream_idx].fill_diagonal_(0, wrap=False)
+#         left_block[stream_idx].triu_(-stream_idx + 1)
+
+#     left_block[:, :, 0] = 0
+#     return torch.cat([left_block, right_block], dim=2)
+@torch.jit.script
+def ngram_attention_bias(sequence_length: int, ngram: int, device: torch.device, dtype: torch.dtype):
     """
     This function computes the bias for the predict stream
     """
-    left_block = torch.ones((ngram, sequence_length, sequence_length), device=device, dtype=dtype) * float("-inf")
-    right_block = left_block.detach().clone()
+    bias = torch.ones((ngram, sequence_length, 2 * sequence_length)) * float("-inf")
     # create bias
     for stream_idx in range(ngram):
-        right_block[stream_idx].fill_diagonal_(0, wrap=False)
-        left_block[stream_idx].triu_(-stream_idx + 1)
+        for i in range(sequence_length):
+            bias[stream_idx, i, sequence_length + i] = 0
 
-    left_block[:, :, 0] = 0
-    return torch.cat([left_block, right_block], dim=2)
+    for stream_idx in range(ngram):
+        for i in range(sequence_length):
+            bias[stream_idx, i, : max(i - stream_idx, 0) + 1] = 0
+
+    return bias
 
 
 def compute_relative_buckets(num_buckets, max_distance, relative_positions, is_bidirectional=False):
@@ -1588,7 +1604,8 @@ class ProphetNetDecoder(ProphetNetPreTrainedModel):
         batch_size, seq_length = hidden_states.shape[:2]
 
         # get causal mask
-        causal_mask = hidden_states.new(seq_length, seq_length).float().fill_(-float("inf"))
+        # causal_mask = hidden_states.new(seq_length, seq_length).float().fill_(-float("inf"))
+        causal_mask = torch.full((seq_length, seq_length), -float("inf"), dtype=torch.float)
         causal_mask = torch.triu(causal_mask, 1)
         extended_causal_mask = causal_mask[:seq_length, :seq_length][None, :, :].expand(
             (batch_size,) + causal_mask.shape
