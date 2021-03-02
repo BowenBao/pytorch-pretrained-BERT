@@ -1,5 +1,5 @@
 python examples/seq2seq/run_seq2seq.py \
-    --model_name_or_path bert-base-uncased \
+    --model_name_or_path t5-large \
     --do_train \
     --do_eval \
     --task summarization \
@@ -10,4 +10,4 @@ python examples/seq2seq/run_seq2seq.py \
     --overwrite_output_dir \
     --predict_with_generate \
     --ortmodule \
-    --onnx_large_model False
+    --onnx_large_model True

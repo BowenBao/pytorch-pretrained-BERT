@@ -1467,7 +1467,7 @@ class Trainer:
         if self.use_ortmodule:
             if self.ort_session is None:
                 with torch.no_grad():
-                    # TODO: determine input name order
+                    # NOTE: determine input name order
                     input_names = ['input_ids', 'attention_mask', 'decoder_input_ids', 'labels']
                     onnx_model_path = 'models/model.onnx'
                     import io
@@ -1508,7 +1508,7 @@ class Trainer:
                     print('Compare results between PT and ORT: ', comp_results)
                     [np.testing.assert_allclose(o1.detach().cpu().numpy(), o2, atol=1e-3, rtol=1e-3) for o1, o2 in zip(outputs_flatten, ort_outputs)]
                     import sys
-                    sys.exit()
+                    sys.exit("Finish testing ONNX export.")
 
                     model.train()
 
