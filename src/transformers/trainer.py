@@ -1469,6 +1469,13 @@ class Trainer:
                 with torch.no_grad():
                     # NOTE: determine input name order
                     input_names = ['input_ids', 'attention_mask', 'decoder_input_ids', 'labels']
+                    from .models.bert.modeling_bert import BertPreTrainedModel
+                    from .models.roberta.modeling_roberta import RobertaPreTrainedModel
+                    from .models.gpt2.modeling_gpt2 import GPT2PreTrainedModel
+                    if isinstance(model, BertPreTrainedModel):
+                        input_names = ['input_ids', 'attention_mask', 'token_type_ids', 'labels']
+                    elif isinstance(model, RobertaPreTrainedModel) or isinstance(model, GPT2PreTrainedModel):
+                        input_names = ['input_ids', 'attention_mask', 'labels']
                     onnx_model_path = 'models/model.onnx'
                     import io
                     f = io.BytesIO()
@@ -1476,6 +1483,8 @@ class Trainer:
                     from .tokenization_utils import BatchEncoding
                     if isinstance(inputs, BatchEncoding):
                         ex_inputs = inputs.data
+                    else:
+                        ex_inputs = inputs
                     torch.onnx.export(model,
                                     (ex_inputs,),
                                     onnx_model_path if self.onnx_large_model else f,
@@ -1483,7 +1492,8 @@ class Trainer:
                                     do_constant_folding=False,
                                     input_names=input_names,
                                     training=torch.onnx.TrainingMode.EVAL,
-                                    use_external_data_format=self.onnx_large_model)
+                                    use_external_data_format=self.onnx_large_model,
+                                    verbose=True,)
 
                     import onnxruntime
                     ort_sess = onnxruntime.InferenceSession(onnx_model_path if self.onnx_large_model else f.getvalue())
@@ -1496,17 +1506,27 @@ class Trainer:
                     outputs_flatten = []
                     outputs_flatten.append(outputs['loss'])
                     outputs_flatten.append(outputs['logits'])
-                    for ts in outputs['past_key_values']:
-                        for t in ts:
-                            outputs_flatten.append(t)
-                    outputs_flatten.append(outputs['encoder_last_hidden_state'])
+                    if 'past_key_values' in outputs:
+                        for ts in outputs['past_key_values']:
+                            for t in ts:
+                                outputs_flatten.append(t)
+                    if 'encoder_last_hidden_state' in outputs:
+                        outputs_flatten.append(outputs['encoder_last_hidden_state'])
 
                     import numpy as np
                     comp_results = [np.allclose(o1.detach().cpu().numpy(), o2, atol=1e-3, rtol=1e-3) for o1, o2 in zip(outputs_flatten, ort_outputs)]
-                    print(outputs_flatten[4], ort_outputs[4])
-                    print(outputs_flatten[5], ort_outputs[5])
                     print('Compare results between PT and ORT: ', comp_results)
                     [np.testing.assert_allclose(o1.detach().cpu().numpy(), o2, atol=1e-3, rtol=1e-3) for o1, o2 in zip(outputs_flatten, ort_outputs)]
+
+                    print('Test export in training mode.')
+                    torch.onnx.export(model,
+                                    (ex_inputs,),
+                                    onnx_model_path if self.onnx_large_model else f,
+                                    opset_version=12,
+                                    do_constant_folding=False,
+                                    input_names=input_names,
+                                    training=torch.onnx.TrainingMode.TRAINING,
+                                    use_external_data_format=self.onnx_large_model)
                     import sys
                     sys.exit("Finish testing ONNX export.")
 
