@@ -11,7 +11,7 @@ from transformers import T5Config, T5ForConditionalGeneration, T5Tokenizer
 from transformers.generation_utils import GenerationMixin, BeamSearchOutput
 from transformers.modeling_outputs import BaseModelOutputWithPast, Seq2SeqLMOutput
 
-from transformers.generation_beam_search import BeamScorer, BeamSearchScorer
+from transformers.generation_beam_search import BeamScorer, BeamSearchScorer, BeamSearchScorerTS
 from transformers.generation_logits_process import LogitsProcessorList, MinLengthLogitsProcessor
 from transformers.file_utils import ModelOutput
 
@@ -61,7 +61,7 @@ def fix_pretrained_model_weight(model):
             except:
                 pass
 
-def create_t5_encoder_decoder(model="t5-base"):
+def create_t5_encoder_decoder(model="t5-base", flatten_decoder_with_past=False):
     """Generates an encoder and a decoder model with a language model head from a pretrained huggingface model
     Args:
         model (str): Name of a pretrained model, or path to a pretrained / finetuned version of T5
@@ -84,7 +84,7 @@ def create_t5_encoder_decoder(model="t5-base"):
 
     t5_encoder = T5Encoder(encoder).eval()
     t5_decoder = T5Decoder(decoder, model.config).eval()
-    t5_decoder_with_past = T5Decoder(decoder, model.config).eval()
+    t5_decoder_with_past = T5Decoder(decoder, model.config, flatten_decoder_with_past).eval()
     t5_lm_head = T5LMHead(lm_head).eval()
     return t5_encoder, t5_decoder, t5_decoder_with_past, t5_lm_head
 
@@ -176,7 +176,7 @@ def generate_onnx_representation(model, encoder_path, decoder_path, lm_path):
     # )
     has_past = torch.tensor(True)
     print('decoder out:', len(decoder_outs_flatten), [v.shape for v in decoder_outs_flatten])
-    decoder_outs_with_past = decoder_with_past(decoder_input_ids, encoder_out, attention_mask, has_past, *decoder_outs_flatten[1:])
+    decoder_outs_with_past = decoder_with_past(decoder_input_ids, encoder_out, attention_mask, has_past, decoder_outs_flatten[1:])
     # NOTE: flatten tuple output.
     d = [decoder_outs_with_past[0]]
     for t in decoder_outs_with_past[1]:
@@ -185,12 +185,12 @@ def generate_onnx_representation(model, encoder_path, decoder_path, lm_path):
     print('decoder out with past: ', len(decoder_outs_with_past), [v.shape for v in decoder_outs_with_past])
 
     print('trace decoder with past')
-    traced_decoder = torch.jit.trace(decoder_with_past, (decoder_input_ids, encoder_out, attention_mask, has_past, *decoder_outs_flatten[1:]))
+    traced_decoder = torch.jit.trace(decoder_with_past, (decoder_input_ids, encoder_out, attention_mask, has_past, decoder_outs_flatten[1:]))
 
     print('export decoder with past')
     _ = torch.onnx._export(
         traced_decoder,
-        (decoder_input_ids, encoder_out, attention_mask, has_past, *decoder_outs_flatten[1:]),
+        (decoder_input_ids, encoder_out, attention_mask, has_past, decoder_outs_flatten[1:]),
         decoder_path,
         opset_version=12,
         input_names=["input_ids", "encoder_hidden_states", "attention_mask", "has_past"] + input_states_names,
@@ -272,12 +272,13 @@ class T5Encoder(torch.nn.Module):
 
 
 class T5Decoder(torch.nn.Module):
-    def __init__(self, decoder, config):
+    def __init__(self, decoder, config, flatten_output=False):
         super().__init__()
         self.decoder = decoder
         self.config = config
+        self.flatten_output = flatten_output
 
-    def forward(self, input_ids, encoder_hidden_states, attention_mask, has_past, *past):
+    def forward(self, input_ids, encoder_hidden_states, attention_mask, has_past, past=None):
         # NOTE: not needed anymore
         # past_arg_key = (
         #     "past_key_value_states"
@@ -286,10 +287,11 @@ class T5Decoder(torch.nn.Module):
         # )
         # past_arg = {past_arg_key: past_key_values}
         past_key_values = tuple()
-        print('len of past: ', len(past))
-        for i in range(len(past) // 4):
-            past_key_values = past_key_values + (past[i*4:i*4+4],)
-            print('len of tuple:', len(past_key_values[-1]))
+        if past is not None:
+            print('len of past: ', len(past))
+            for i in range(len(past) // 4):
+                past_key_values = past_key_values + (past[i*4:i*4+4],)
+                print('len of tuple:', len(past_key_values[-1]))
         if len(past_key_values) == 0:
             past_key_values = None
         else:
@@ -308,12 +310,12 @@ class T5Decoder(torch.nn.Module):
         sequence_output = decoder_output.last_hidden_state
         sequence_output = sequence_output * (self.config.d_model ** -0.5)
 
-        # # NOTE: flatten tuple output.
-        # if past_key_values is not None:
-        #     d = [sequence_output]
-        #     for t in past_key_values:
-        #         d = d + list(t)
-        #     return tuple(d)
+        # NOTE: flatten tuple output.
+        if self.flatten_output and past_key_values is not None:
+            d = []
+            for t in past_key_values:
+                d = d + list(t)
+            return sequence_output, d
 
         return sequence_output, past_key_values
 
@@ -451,6 +453,35 @@ class T5ConfigTS(T5Config, torch.nn.Module):
     def init_module(self):
         torch.nn.Module.__init__(self)
 
+class MinLengthLogitsProcessorTS(torch.nn.Module):
+    r"""
+    :class:`transformers.LogitsProcessor` enforcing a min-length by setting EOS probability to 0.
+
+    Args:
+        min_length (:obj:`int`):
+            The minimum length below which the score of :obj:`eos_token_id` is set to :obj:`-float("Inf")`.
+        eos_token_id (:obj:`int`):
+            The id of the `end-of-sequence` token.
+    """
+
+    def __init__(self, min_length: int, eos_token_id: int):
+        super().__init__()
+
+        if not isinstance(min_length, int) or min_length < 0:
+            raise ValueError(f"`min_length` has to be a positive integer, but is {min_length}")
+
+        if not isinstance(eos_token_id, int) or eos_token_id < 0:
+            raise ValueError(f"`eos_token_id` has to be a positive integer, but is {eos_token_id}")
+
+        self.min_length = min_length
+        self.eos_token_id = eos_token_id
+
+    def forward(self, input_ids, scores) -> torch.Tensor:
+        cur_len = input_ids.shape[-1]
+        if cur_len < self.min_length:
+            scores[:, self.eos_token_id] = -float("inf")
+        return scores
+
 class SimplifiedGenerator(torch.nn.Module, GenerationMixin):
     def __init__(self, model_name_or_path, onnx_path):
         super().__init__()
@@ -461,6 +492,8 @@ class SimplifiedGenerator(torch.nn.Module, GenerationMixin):
         # self.config = T5Config.from_pretrained(model_name_or_path)
         self.config = T5ConfigTS.from_pretrained(model_name_or_path)
         self.config.init_module()
+
+        self.decoder_start_token_id = self._get_decoder_start_token_id(decoder_start_token_id=None, bos_token_id=self.config.bos_token_id)
         # self.max_length = config.max_length
         # self.min_length = config.min_length
         # self.pad_token_id = config.pad_token_id
@@ -478,11 +511,14 @@ class SimplifiedGenerator(torch.nn.Module, GenerationMixin):
         # self.early_stopping = config.early_stopping
 
         # NOTE: to create traced modules to run later.
+        self.logits_processor = MinLengthLogitsProcessorTS(self.config.min_length, self.config.eos_token_id)
+        self.beam_scorer = BeamSearchScorerTS()
+
         self._trace_modules()
 
     def _trace_modules(self):
         model = self.model_name_or_path.as_posix()
-        simplified_encoder, decoder, decoder_with_past, lm_head = create_t5_encoder_decoder(model)
+        simplified_encoder, decoder, decoder_with_past, lm_head = create_t5_encoder_decoder(model, flatten_decoder_with_past=True)
 
         # Example sequence
         tok = T5Tokenizer.from_pretrained(model)
@@ -502,14 +538,15 @@ class SimplifiedGenerator(torch.nn.Module, GenerationMixin):
         d = [decoder_outs[0]]
         for t in decoder_outs[1]:
             d = d + list(t)
-        decoder_outs_flatten = tuple(d)
+        decoder_outs_flatten = d
 
         has_past = torch.tensor(True)
         print('Tracing decoder with input shape:', decoder_input_ids.shape, encoder_out.shape, attention_mask.shape)
-        traced_decoder = torch.jit.trace(decoder_with_past, (decoder_input_ids, encoder_out, attention_mask, has_past, *decoder_outs_flatten[1:]))
+        traced_decoder = torch.jit.trace(decoder_with_past, (decoder_input_ids, encoder_out, attention_mask, has_past, decoder_outs_flatten[1:]))
 
         print(traced_decoder)
         print('Traced attention graph:', getattr(getattr(traced_decoder.decoder.block, '0').layer, '1').EncDecAttention.graph)
+        print('Traced decoder graph:', traced_decoder.graph)
         traced_lm_head = torch.jit.trace(lm_head, (decoder_outs_flatten[0],))
 
         self.encoder = traced_simplified_encoder
@@ -526,34 +563,35 @@ class SimplifiedGenerator(torch.nn.Module, GenerationMixin):
         past_key_values=None,
         **kwargs,
     ):
-        if input_ids is not None:
+        if input_ids is not None and attention_mask is not None:
             return self._encoder_forward(input_ids=input_ids, attention_mask=attention_mask)
 
+        return self._decoder_forward(decoder_input_ids, attention_mask, encoder_outputs, past_key_values)
+
+    def _encoder_forward(self, input_ids, attention_mask):
+        last_hidden_state = self.encoder(input_ids, attention_mask)
+        return last_hidden_state
+
+    def _decoder_forward(self, decoder_input_ids, attention_mask, encoder_outputs, past_key_values:Optional[List[torch.Tensor]] = None):
         if past_key_values is not None:
             has_past = torch.tensor(True)
-            past_key_values = flatten_past(past_key_values)
         else:
             has_past = torch.tensor(False)
-            # TODO: fix this hack
+            # TODO: fix this hack. This is for working around optional input.
             past_key_values = [torch.ones(1, 8, 1, 64) for _ in range(24)]
-
         print('calling decoder with input shape:', decoder_input_ids.shape, encoder_outputs.shape, attention_mask.shape)
-        decoder_output, past = self.decoder(decoder_input_ids, encoder_outputs, attention_mask, has_past, *past_key_values)
-        # decoder_output, past = self.decoder_(decoder_input_ids, encoder_outputs, attention_mask, has_past, *past_key_values)
+        decoder_output, past = self.decoder(decoder_input_ids, encoder_outputs, attention_mask, has_past, past_key_values)
         lm_logits = self.lm_head(decoder_output)
-        return Seq2SeqLMOutput(logits=lm_logits, past_key_values=past)
-
-    def _encoder_forward(self, input_ids=None, attention_mask=None):
-        last_hidden_state = self.encoder(input_ids, attention_mask)
-        return BaseModelOutputWithPast(last_hidden_state=last_hidden_state)
+        return lm_logits, past
+        # return Seq2SeqLMOutput(logits=lm_logits, past_key_values=past)
 
     def get_encoder(self):
         return self
 
-    def prepare_inputs_for_generation(self, input_ids, attention_mask, use_cache, encoder_outputs: ModelOutput, past=None):
+    def prepare_inputs_for_generation(self, input_ids, attention_mask, use_cache:bool, last_hidden_state, past:Optional[List[torch.Tensor]]=None):
         if past is not None:
             input_ids = input_ids[:, -1:]
-        return input_ids, past, encoder_outputs.last_hidden_state, attention_mask, True
+        return input_ids, past, last_hidden_state, attention_mask, True
         # return {
         #     "decoder_input_ids": input_ids,
         #     "past_key_values": past,
@@ -563,37 +601,20 @@ class SimplifiedGenerator(torch.nn.Module, GenerationMixin):
         # }
 
 
-    def _reorder_cache(self, past, beam_idx):
+    def _reorder_cache(self, past:List[torch.Tensor], beam_idx):
         # if decoder past is not included in output
         # speedy decoding is disabled and no need to reorder
-        if past is None:
-            logger.warning("You might want to consider setting `use_cache=True` to speed up decoding")
-            return past
-        print('calling into reorder cache')
-        reordered_decoder_past = ()
-        for layer_past_states in past:
-            # get the correct batch idx from layer past batch dim
-            # batch dim of `past` is at 2nd position
-            reordered_layer_past_states = ()
-            for layer_past_state in layer_past_states:
-                # need to set correct `past` for each of the four key / value states
-                reordered_layer_past_states = reordered_layer_past_states + (
-                    layer_past_state.index_select(0, beam_idx),
-                )
-
-            assert reordered_layer_past_states[0].shape == layer_past_states[0].shape
-            assert len(reordered_layer_past_states) == len(layer_past_states)
-
-            reordered_decoder_past = reordered_decoder_past + (reordered_layer_past_states,)
+        print('past for reorder cache size:', len(past))
+        reordered_decoder_past = []
+        for state in past:
+            reordered_decoder_past.append(state.index_select(0, beam_idx))
         return reordered_decoder_past
 
     def beam_search(
         self,
-        input_ids: torch.LongTensor,
-        beam_scorer: BeamScorer,
-        attention_mask: torch.LongTensor,
-        encoder_outputs: ModelOutput,
-        logits_processor: Optional[LogitsProcessorList] = None,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        last_hidden_state: torch.Tensor,
         max_length: Optional[int] = None,
         pad_token_id: Optional[int] = None,
         eos_token_id: Optional[int] = None,
@@ -601,7 +622,7 @@ class SimplifiedGenerator(torch.nn.Module, GenerationMixin):
         output_hidden_states: Optional[bool] = None,
         output_scores: Optional[bool] = None,
         return_dict_in_generate: Optional[bool] = None,
-    ) -> Union[BeamSearchOutput, torch.LongTensor]:
+    ) -> torch.Tensor:
         r"""
         Generates sequences for models with a language modeling head using beam search decoding.
 
@@ -695,17 +716,17 @@ class SimplifiedGenerator(torch.nn.Module, GenerationMixin):
             >>> print("Generated:", tokenizer.batch_decode(outputs, skip_special_tokens=True))
         """
         # NOTE: encoder_outputs is used in main function
+        # NOTE: encoder_outputs is ModelOutput type, not supported by TorchScript.
+        #       just return last_hidden_state for now.
         #
-        model_kwargs = {
-            'attention_mask': attention_mask,
-            'output_attentions': output_attentions,
-            'output_hidden_states': output_hidden_states,
-            'encoder_outputs': encoder_outputs,
-        }
-
+        # model_kwargs = {
+        #     'attention_mask': attention_mask,
+        #     'output_attentions': output_attentions,
+        #     'output_hidden_states': output_hidden_states,
+        #     'encoder_outputs': encoder_outputs,
+        # }
 
         # init values
-        logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
         max_length = max_length if max_length is not None else self.config.max_length
         pad_token_id = pad_token_id if pad_token_id is not None else self.config.pad_token_id
         eos_token_id = eos_token_id if eos_token_id is not None else self.config.eos_token_id
@@ -724,14 +745,14 @@ class SimplifiedGenerator(torch.nn.Module, GenerationMixin):
         decoder_hidden_states = () if (return_dict_in_generate and output_hidden_states) else None
 
         # if model is an encoder-decoder, retrieve encoder attention weights and hidden states
-        if return_dict_in_generate and self.config.is_encoder_decoder:
-            encoder_attentions = encoder_outputs.get("attentions") if output_attentions else None
-            encoder_hidden_states = (
-                encoder_outputs.get("hidden_states") if output_hidden_states else None
-            )
+        # if return_dict_in_generate and self.config.is_encoder_decoder:
+        #     encoder_attentions = encoder_outputs.get("attentions") if output_attentions else None
+        #     encoder_hidden_states = (
+        #         encoder_outputs.get("hidden_states") if output_hidden_states else None
+        #     )
 
-        batch_size = len(beam_scorer._beam_hyps)
-        num_beams = beam_scorer.num_beams
+        batch_size = len(self.beam_scorer._beam_hyps)
+        num_beams = self.beam_scorer.num_beams
 
         batch_beam_size, cur_len = input_ids.shape
 
@@ -742,8 +763,10 @@ class SimplifiedGenerator(torch.nn.Module, GenerationMixin):
         beam_scores = torch.zeros((batch_size, num_beams), dtype=torch.float, device=input_ids.device)
         beam_scores[:, 1:] = -1e9
         beam_scores = beam_scores.view((batch_size * num_beams,))
+        next_tokens = torch.zeros((batch_size, num_beams), dtype=torch.long, device=input_ids.device)
+        next_indices = torch.zeros((batch_size, num_beams), dtype=torch.long, device=input_ids.device)
 
-        past = None
+        past : Optional[List[torch.Tensor]] = None
         while cur_len < max_length:
             # NOTE: input_ids, attention_mask, use_cache, encoder_outputs, past=None are used as input
             # Expands to
@@ -759,46 +782,51 @@ class SimplifiedGenerator(torch.nn.Module, GenerationMixin):
                 input_ids,
                 attention_mask,
                 True,
-                encoder_outputs,
+                last_hidden_state,
                 past,
             )
 
-            outputs = self(
+            # NOTE: was returning Output of type Seq2SeqLMOutput, but that is not scriptable
+            logits, past = self._decoder_forward(
                 decoder_input_ids=decoder_input_ids,
                 past_key_values=past_key_values,
                 encoder_outputs=last_hidden_state,
                 attention_mask=attention_mask,
-                return_dict=True,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
+                # return_dict=True,
+                # output_attentions=output_attentions,
+                # output_hidden_states=output_hidden_states,
             )
-            next_token_logits = outputs.logits[:, -1, :]
+            # next_token_logits = outputs.logits[:, -1, :]
+            # NOTE: was returning Output of type Seq2SeqLMOutput, but that is not scriptable
+            next_token_logits = logits[:, -1, :]
 
             # adjust tokens for Bart, *e.g.*
-            next_token_logits = self.adjust_logits_during_generation(
-                next_token_logits, cur_len=cur_len, max_length=max_length
-            )
+            # NOTE: unused
+            # next_token_logits = self.adjust_logits_during_generation(
+            #     next_token_logits, cur_len=cur_len, max_length=max_length
+            # )
 
             next_token_scores = F.log_softmax(next_token_logits, dim=-1)  # (batch_size * num_beams, vocab_size)
 
-            next_token_scores = logits_processor(input_ids, next_token_scores)
+            next_token_scores = self.logits_processor(input_ids, next_token_scores)
             next_token_scores = next_token_scores + beam_scores[:, None].expand_as(next_token_scores)
 
             # Store scores, attentions and hidden_states when required
-            if return_dict_in_generate:
-                if output_scores:
-                    scores += (next_token_scores,)
-                if output_attentions:
-                    decoder_attentions += (
-                        (outputs.decoder_attentions,) if self.config.is_encoder_decoder else (outputs.attentions,)
-                    )
+            # NOTE: skipped, not used in production.
+            # if return_dict_in_generate:
+            #     if output_scores:
+            #         scores += (next_token_scores,)
+            #     if output_attentions:
+            #         decoder_attentions += (
+            #             (outputs.decoder_attentions,) if self.config.is_encoder_decoder else (outputs.attentions,)
+            #         )
 
-                if output_hidden_states:
-                    decoder_hidden_states += (
-                        (outputs.decoder_hidden_states,)
-                        if self.config.is_encoder_decoder
-                        else (outputs.hidden_states,)
-                    )
+            #     if output_hidden_states:
+            #         decoder_hidden_states += (
+            #             (outputs.decoder_hidden_states,)
+            #             if self.config.is_encoder_decoder
+            #             else (outputs.hidden_states,)
+            #         )
 
             # reshape for beam search
             vocab_size = next_token_scores.shape[-1]
@@ -812,7 +840,7 @@ class SimplifiedGenerator(torch.nn.Module, GenerationMixin):
             next_tokens = next_tokens % vocab_size
 
             # stateless
-            beam_outputs = beam_scorer.process(
+            beam_scores, beam_next_tokens, beam_idx = self.beam_scorer.process(
                 input_ids,
                 next_token_scores,
                 next_tokens,
@@ -820,9 +848,6 @@ class SimplifiedGenerator(torch.nn.Module, GenerationMixin):
                 pad_token_id=pad_token_id,
                 eos_token_id=eos_token_id,
             )
-            beam_scores = beam_outputs["next_beam_scores"]
-            beam_next_tokens = beam_outputs["next_beam_tokens"]
-            beam_idx = beam_outputs["next_beam_indices"]
 
             input_ids = torch.cat([input_ids[beam_idx, :], beam_next_tokens.unsqueeze(-1)], dim=-1)
 
@@ -833,42 +858,45 @@ class SimplifiedGenerator(torch.nn.Module, GenerationMixin):
             # )
             # if model_kwargs["past"] is not None:
             #     model_kwargs["past"] = self._reorder_cache(model_kwargs["past"], beam_idx)
-            past = outputs.past_key_values
+
+            # NOTE: skip this because past is already assigned when returned
+            # past = outputs.past_key_values
             if past is not None:
                 past = self._reorder_cache(past, beam_idx)
 
-            if beam_scorer.is_done:
+            if self.beam_scorer.is_done:
                 break
 
-        sequence_outputs = beam_scorer.finalize(
+        sequences, sequence_scores = self.beam_scorer.finalize(
             input_ids, beam_scores, next_tokens, next_indices, pad_token_id=pad_token_id, eos_token_id=eos_token_id
         )
 
-        if return_dict_in_generate:
-            if not output_scores:
-                sequence_outputs["sequence_scores"] = None
-            if self.config.is_encoder_decoder:
-                return BeamSearchEncoderDecoderOutput(
-                    sequences=sequence_outputs["sequences"],
-                    sequences_scores=sequence_outputs["sequence_scores"],
-                    scores=scores,
-                    encoder_attentions=encoder_attentions,
-                    encoder_hidden_states=encoder_hidden_states,
-                    decoder_attentions=decoder_attentions,
-                    decoder_hidden_states=decoder_hidden_states,
-                )
-            else:
-                return BeamSearchDecoderOnlyOutput(
-                    sequences=sequence_outputs["sequences"],
-                    sequences_scores=sequence_outputs["sequence_scores"],
-                    scores=scores,
-                    attentions=decoder_attentions,
-                    hidden_states=decoder_hidden_states,
-                )
-        else:
-            return sequence_outputs["sequences"]
+        # if return_dict_in_generate:
+        #     if not output_scores:
+        #         sequence_scores = None
+        #     if self.config.is_encoder_decoder:
+        #         return BeamSearchEncoderDecoderOutput(
+        #             sequences=sequences,
+        #             sequences_scores=sequence_scores,
+        #             scores=scores,
+        #             encoder_attentions=encoder_attentions,
+        #             encoder_hidden_states=encoder_hidden_states,
+        #             decoder_attentions=decoder_attentions,
+        #             decoder_hidden_states=decoder_hidden_states,
+        #         )
+        #     else:
+        #         return BeamSearchDecoderOnlyOutput(
+        #             sequences=sequences,
+        #             sequences_scores=sequence_scores,
+        #             scores=scores,
+        #             attentions=decoder_attentions,
+        #             hidden_states=decoder_hidden_states,
+        #         )
+        # else:
+        return sequences
 
     def generate_beam_search(self, input_ids, attention_mask, num_beams: int,
+                             decoder_input_ids: Optional[torch.Tensor] = None,
                              num_beam_groups: Optional[int] = None,
                              max_length: Optional[int] = None,
                              min_length: Optional[int] = None,
@@ -891,9 +919,6 @@ class SimplifiedGenerator(torch.nn.Module, GenerationMixin):
                              bad_words_ids: Optional[List[int]] = None,
                              diversity_penalty: Optional[float] = None,
                              ):
-        model_kwargs : Dict[str, Union[torch.Tensor, List[torch.Tensor]]] = {
-            'attention_mask': attention_mask
-        }
         # set init values
         num_beam_groups = num_beam_groups if num_beam_groups is not None else self.config.num_beam_groups
         max_length = max_length if max_length is not None else self.config.max_length
@@ -915,16 +940,16 @@ class SimplifiedGenerator(torch.nn.Module, GenerationMixin):
             return_dict_in_generate if return_dict_in_generate is not None else self.config.return_dict_in_generate
         )
 
-        model_kwargs["output_attentions"] = output_attentions
-        model_kwargs["output_hidden_states"] = output_hidden_states
+        # model_kwargs["output_attentions"] = output_attentions
+        # model_kwargs["output_hidden_states"] = output_hidden_states
 
         if input_ids is None:
             # init `input_ids` with bos_token_id
             input_ids = self._prepare_input_ids_for_generation(bos_token_id)
 
-        if model_kwargs.get("attention_mask", None) is None:
+        if attention_mask is None:
             # init `attention_mask` depending on `pad_token_id`
-            model_kwargs["attention_mask"] = self._prepare_attention_mask_for_generation(
+            attention_mask = self._prepare_attention_mask_for_generation(
                 input_ids, pad_token_id, eos_token_id
             )
 
@@ -936,27 +961,27 @@ class SimplifiedGenerator(torch.nn.Module, GenerationMixin):
         # Storing encoder_input_ids for logits_processor that could use them
         encoder_input_ids = input_ids if self.config.is_encoder_decoder else None
 
-        if self.config.is_encoder_decoder:
-            # add encoder_outputs to model_kwargs
-            model_kwargs = self._prepare_encoder_decoder_kwargs_for_generation(input_ids, model_kwargs)
 
-            # set input_ids as decoder_input_ids
-            if "decoder_input_ids" in model_kwargs:
-                input_ids = model_kwargs.pop("decoder_input_ids")
-            else:
-                input_ids = self._prepare_decoder_input_ids_for_generation(
-                    input_ids, decoder_start_token_id=decoder_start_token_id, bos_token_id=bos_token_id
-                )
+        # add encoder_outputs to model_kwargs
+        # NOTE: rewrite below line to avoid using kwargs
+        # model_kwargs = self._prepare_encoder_decoder_kwargs_for_generation(input_ids, model_kwargs)
+        last_hidden_state = self._encoder_forward(input_ids, attention_mask)
 
-            if "encoder_outputs" not in model_kwargs or not isinstance(model_kwargs["encoder_outputs"], ModelOutput):
-                raise ValueError("Make sure that `model_kwargs` include `encoder_outputs` of type `ModelOutput`.")
-
-        if input_ids.shape[-1] >= max_length:
-            input_ids_string = "decoder_input_ids" if self.config.is_encoder_decoder else "input_ids"
-            logger.warning(
-                f"Input length of {input_ids_string} is {input_ids.shape[-1]}, but ``max_length`` is set to {max_length}."
-                "This can lead to unexpected behavior. You should consider increasing ``config.max_length`` or ``max_length``."
+        # set input_ids as decoder_input_ids
+        if decoder_input_ids is not None:
+            # input_ids = model_kwargs.pop("decoder_input_ids")
+            input_ids = decoder_input_ids
+        else:
+            input_ids = self._prepare_decoder_input_ids_for_generation(
+                input_ids, decoder_start_token_id=decoder_start_token_id, bos_token_id=bos_token_id
             )
+
+        # if input_ids.shape[-1] >= max_length:
+        #     input_ids_string = "decoder_input_ids" if self.config.is_encoder_decoder else "input_ids"
+        #     logger.warning(
+        #         f"Input length of {input_ids_string} is {input_ids.shape[-1]}, but ``max_length`` is set to {max_length}."
+        #         "This can lead to unexpected behavior. You should consider increasing ``config.max_length`` or ``max_length``."
+        #     )
 
         # determine generation mode
         is_greedy_gen_mode = (num_beams == 1) and (num_beam_groups == 1) and do_sample is False
@@ -972,7 +997,7 @@ class SimplifiedGenerator(torch.nn.Module, GenerationMixin):
             )
 
         # set model_kwargs
-        model_kwargs["use_cache"] = use_cache
+        # model_kwargs["use_cache"] = use_cache
 
         # get distribution pre_processing samplers
         # NOTE: callable not supported, remove prefix_allowed_tokens_fn
@@ -992,8 +1017,10 @@ class SimplifiedGenerator(torch.nn.Module, GenerationMixin):
         # )
         min_length = min_length if min_length is not None else self.config.min_length
         eos_token_id = eos_token_id if eos_token_id is not None else self.config.eos_token_id
-        logits_processor = LogitsProcessorList()
-        logits_processor.append(MinLengthLogitsProcessor(min_length, eos_token_id))
+        # NOTE: Stock LogitsProcessor is not nn.Module. And neither is nn.Module obj scriptable as method arg.
+        #       Work around by storing as model attribute.
+        # logits_processor = LogitsProcessorList()
+        # logits_processor.append(MinLengthLogitsProcessor(min_length, eos_token_id))
 
         batch_size = input_ids.shape[0]
 
@@ -1003,7 +1030,7 @@ class SimplifiedGenerator(torch.nn.Module, GenerationMixin):
         if num_return_sequences > num_beams:
             raise ValueError("`num_return_sequences` has to be smaller or equal to `num_beams`.")
 
-        beam_scorer = BeamSearchScorer(
+        self.beam_scorer.init(
             batch_size=batch_size,
             max_length=max_length,
             num_beams=num_beams,
@@ -1013,19 +1040,14 @@ class SimplifiedGenerator(torch.nn.Module, GenerationMixin):
             num_beam_hyps_to_keep=num_return_sequences,
         )
         # interleave with `num_beams`
-        print('model_kwargs for _expand_inputs_for_generation: ', model_kwargs)
-        input_ids, attention_mask, encoder_outputs = self._expand_inputs_for_generation(
-            input_ids, model_kwargs['attention_mask'], model_kwargs['encoder_outputs'], expand_size=num_beams,
+        input_ids, attention_mask, last_hidden_state = self._expand_inputs_for_generation(
+            input_ids, attention_mask, last_hidden_state, expand_size=num_beams,
         )
-        model_kwargs['attention_mask'] = attention_mask
-        model_kwargs['encoder_outputs'] = encoder_outputs
-        print('model_kwargs after _expand_inputs_for_generation: ', model_kwargs)
+
         return self.beam_search(
             input_ids,
-            beam_scorer,
             attention_mask,
-            encoder_outputs,
-            logits_processor=logits_processor,
+            last_hidden_state,
             max_length=max_length,
             pad_token_id=pad_token_id,
             eos_token_id=eos_token_id,
@@ -1035,11 +1057,11 @@ class SimplifiedGenerator(torch.nn.Module, GenerationMixin):
 
     @staticmethod
     def _expand_inputs_for_generation(
-        input_ids: torch.LongTensor,
-        attention_mask: torch.LongTensor,
-        encoder_outputs: ModelOutput,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        last_hidden_state: torch.Tensor,
         expand_size: int = 1,
-    ) -> Tuple[torch.LongTensor, torch.LongTensor, ModelOutput]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         expanded_return_idx = (
             torch.arange(input_ids.shape[0]).view(-1, 1).repeat(1, expand_size).view(-1).to(input_ids.device)
         )
@@ -1047,12 +1069,23 @@ class SimplifiedGenerator(torch.nn.Module, GenerationMixin):
 
         attention_mask = attention_mask.index_select(0, expanded_return_idx)
 
-        encoder_outputs["last_hidden_state"] = encoder_outputs.last_hidden_state.index_select(
-            0, expanded_return_idx.to(encoder_outputs.last_hidden_state.device)
+        last_hidden_state = last_hidden_state.index_select(
+            0, expanded_return_idx.to(last_hidden_state.device)
         )
-        return input_ids, attention_mask, encoder_outputs
+        return input_ids, attention_mask, last_hidden_state
 
-    def forward(self, input_ids, attention_mask, num_beams):
+    # NOTE: reason for rewrite is `torch.LongTensor` not supported by torch script
+    def _prepare_decoder_input_ids_for_generation(
+        self, input_ids: torch.Tensor, decoder_start_token_id: Optional[int] = None, bos_token_id: Optional[int] = None
+    ) -> torch.Tensor:
+        decoder_start_token_id = self.decoder_start_token_id  # self._get_decoder_start_token_id(decoder_start_token_id, bos_token_id)
+        decoder_input_ids = (
+            torch.ones((input_ids.shape[0], 1), dtype=input_ids.dtype, device=input_ids.device)
+            * decoder_start_token_id
+        )
+        return decoder_input_ids
+
+    def forward(self, input_ids, attention_mask, num_beams: int):
         return self.generate_beam_search(input_ids, attention_mask, num_beams)
 
 
@@ -1106,7 +1139,7 @@ class OnnxT5_Full(GenerationMixin, torch.nn.Module):
 
         has_past = torch.tensor(True)
         print('Tracing decoder with input shape:', decoder_input_ids.shape, encoder_out.shape, attention_mask.shape)
-        traced_decoder = torch.jit.trace(decoder_with_past, (decoder_input_ids, encoder_out, attention_mask, has_past, *decoder_outs_flatten[1:]))
+        traced_decoder = torch.jit.trace(decoder_with_past, (decoder_input_ids, encoder_out, attention_mask, has_past, decoder_outs_flatten[1:]))
 
         print(traced_decoder)
         print('Traced attention graph:', getattr(getattr(traced_decoder.decoder.block, '0').layer, '1').EncDecAttention.graph)
@@ -1139,7 +1172,7 @@ class OnnxT5_Full(GenerationMixin, torch.nn.Module):
             past_key_values = [torch.ones(1, 8, 1, 64) for _ in range(24)]
 
         print('calling decoder with input shape:', decoder_input_ids.shape, encoder_outputs.shape, attention_mask.shape)
-        decoder_output, past = self.decoder(decoder_input_ids, encoder_outputs, attention_mask, has_past, *past_key_values)
+        decoder_output, past = self.decoder(decoder_input_ids, encoder_outputs, attention_mask, has_past, past_key_values)
         # decoder_output, past = self.decoder_(decoder_input_ids, encoder_outputs, attention_mask, has_past, *past_key_values)
         lm_logits = self.lm_head(decoder_output)
         return Seq2SeqLMOutput(logits=lm_logits, past_key_values=past)

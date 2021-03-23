@@ -312,11 +312,11 @@ class T5AttentionProject(torch.nn.Module):
         self.k = nn.Linear(self.d_model, self.inner_dim, bias=False)
         self.v = nn.Linear(self.d_model, self.inner_dim, bias=False)
 
-    def shape(self, states, batch_size:int):
+    def shape(self, states, batch_size):
         """  projection """
         return states.view(batch_size, -1, self.n_heads, self.key_value_proj_dim).transpose(1, 2)
 
-    def unshape(self, states, batch_size:int):
+    def unshape(self, states, batch_size):
         """  reshape """
         return states.transpose(1, 2).contiguous().view(batch_size, -1, self.inner_dim)
 
@@ -326,7 +326,7 @@ class T5AttentionProject(torch.nn.Module):
         hidden_states,
         key_value_states: Optional[torch.Tensor],
         past_key_value: Optional[torch.Tensor],
-        batch_size:int,
+        batch_size,
         has_past=torch.tensor(True)):
         if past_key_value is None or not has_past:
             if key_value_states is None:
@@ -355,7 +355,7 @@ class T5AttentionProject(torch.nn.Module):
         hidden_states,
         key_value_states: Optional[torch.Tensor],
         past_key_value: Optional[torch.Tensor],
-        batch_size:int,
+        batch_size,
         has_past=torch.tensor(True)):
         if past_key_value is None or not has_past:
             if key_value_states is None:
@@ -579,7 +579,8 @@ class T5Attention(nn.Module):
         # Input is (batch_size, seq_length, dim)
         # Mask is (batch_size, key_length) (non-causal) or (batch_size, key_length, key_length)
         # past_key_value[0] is (batch_size, n_heads, q_len - 1, dim_per_head)
-        batch_size, seq_length = hidden_states.shape[:2]
+        _, seq_length = hidden_states.shape[:2]
+        batch_size = torch._shape_as_tensor(hidden_states)[0]
 
         # if past_key_value is not None:
         #     assert (

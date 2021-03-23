@@ -395,7 +395,7 @@ class GenerationMixin:
             pad_token_id = eos_token_id
         return pad_token_id
 
-    def _get_decoder_start_token_id(self, decoder_start_token_id: int = None, bos_token_id: int = None) -> int:
+    def _get_decoder_start_token_id(self, decoder_start_token_id: Optional[int] = None, bos_token_id: Optional[int] = None) -> int:
         decoder_start_token_id = (
             decoder_start_token_id if decoder_start_token_id is not None else self.config.decoder_start_token_id
         )
