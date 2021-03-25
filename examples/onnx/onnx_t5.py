@@ -751,7 +751,7 @@ class SimplifiedGenerator(torch.nn.Module, GenerationMixin):
         #         encoder_outputs.get("hidden_states") if output_hidden_states else None
         #     )
 
-        batch_size = len(self.beam_scorer._beam_hyps)
+        batch_size = len(self.beam_scorer._beam_hyps_count)
         num_beams = self.beam_scorer.num_beams
 
         batch_beam_size, cur_len = input_ids.shape
