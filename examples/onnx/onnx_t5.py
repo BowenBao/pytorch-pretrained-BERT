@@ -572,8 +572,8 @@ class SimplifiedGenerator(torch.nn.Module, GenerationMixin):
         last_hidden_state = self.encoder(input_ids, attention_mask)
         return last_hidden_state
 
-    def _decoder_forward(self, decoder_input_ids, attention_mask, encoder_outputs, past_key_values:Optional[List[torch.Tensor]] = None):
-        if past_key_values is not None:
+    def _decoder_forward(self, decoder_input_ids, attention_mask, encoder_outputs, past_key_values:List[torch.Tensor]):
+        if len(past_key_values) > 0:
             has_past = torch.tensor(True)
         else:
             has_past = torch.tensor(False)
@@ -588,8 +588,8 @@ class SimplifiedGenerator(torch.nn.Module, GenerationMixin):
     def get_encoder(self):
         return self
 
-    def prepare_inputs_for_generation(self, input_ids, attention_mask, use_cache:bool, last_hidden_state, past:Optional[List[torch.Tensor]]=None):
-        if past is not None:
+    def prepare_inputs_for_generation(self, input_ids, attention_mask, use_cache:bool, last_hidden_state, past:List[torch.Tensor]):
+        if len(past) > 0:
             input_ids = input_ids[:, -1:]
         return input_ids, past, last_hidden_state, attention_mask, True
         # return {
@@ -744,6 +744,18 @@ class SimplifiedGenerator(torch.nn.Module, GenerationMixin):
         decoder_attentions = () if (return_dict_in_generate and output_attentions) else None
         decoder_hidden_states = () if (return_dict_in_generate and output_hidden_states) else None
 
+        batch_size = self.beam_scorer.batch_size
+
+        # NOTE: initialize beam search hypotheses list.
+        #       This is a workaround for GetAttr/SetAttr not supported well inside loops.
+        _beam_hyps : List[torch.Tensor] = []
+        _beam_scores : List[torch.Tensor] = []
+        _beam_hyps_count = torch.zeros(batch_size, dtype=torch.long)
+        _beam_hyps_worst_scores = torch.zeros(batch_size) + 1e9
+        # TODO: fix this
+        # _done = torch.tensor([False for _ in range(batch_size)], dtype=torch.bool)
+        _done = torch.zeros(batch_size, dtype=torch.bool)
+
         # if model is an encoder-decoder, retrieve encoder attention weights and hidden states
         # if return_dict_in_generate and self.config.is_encoder_decoder:
         #     encoder_attentions = encoder_outputs.get("attentions") if output_attentions else None
@@ -751,9 +763,7 @@ class SimplifiedGenerator(torch.nn.Module, GenerationMixin):
         #         encoder_outputs.get("hidden_states") if output_hidden_states else None
         #     )
 
-        batch_size = len(self.beam_scorer._beam_hyps_count)
         num_beams = self.beam_scorer.num_beams
-
         batch_beam_size, cur_len = input_ids.shape
 
         assert (
@@ -766,7 +776,7 @@ class SimplifiedGenerator(torch.nn.Module, GenerationMixin):
         next_tokens = torch.zeros((batch_size, num_beams), dtype=torch.long, device=input_ids.device)
         next_indices = torch.zeros((batch_size, num_beams), dtype=torch.long, device=input_ids.device)
 
-        past : Optional[List[torch.Tensor]] = None
+        past : List[torch.Tensor] = []
         while cur_len < max_length:
             # NOTE: input_ids, attention_mask, use_cache, encoder_outputs, past=None are used as input
             # Expands to
@@ -840,11 +850,16 @@ class SimplifiedGenerator(torch.nn.Module, GenerationMixin):
             next_tokens = next_tokens % vocab_size
 
             # stateless
-            beam_scores, beam_next_tokens, beam_idx = self.beam_scorer.process(
+            beam_scores, beam_next_tokens, beam_idx, _beam_hyps, _beam_scores, _beam_hyps_count, _beam_hyps_worst_scores, _done = self.beam_scorer.process(
                 input_ids,
                 next_token_scores,
                 next_tokens,
                 next_indices,
+                _beam_hyps=_beam_hyps,
+                _beam_scores=_beam_scores,
+                _beam_hyps_count=_beam_hyps_count,
+                _beam_hyps_worst_scores=_beam_hyps_worst_scores,
+                _done=_done,
                 pad_token_id=pad_token_id,
                 eos_token_id=eos_token_id,
             )
@@ -861,14 +876,20 @@ class SimplifiedGenerator(torch.nn.Module, GenerationMixin):
 
             # NOTE: skip this because past is already assigned when returned
             # past = outputs.past_key_values
-            if past is not None:
+            if len(past) > 0:
                 past = self._reorder_cache(past, beam_idx)
 
-            if self.beam_scorer.is_done:
+            if self.beam_scorer.is_done(_done):
                 break
 
         sequences, sequence_scores = self.beam_scorer.finalize(
-            input_ids, beam_scores, next_tokens, next_indices, pad_token_id=pad_token_id, eos_token_id=eos_token_id
+            input_ids, beam_scores, next_tokens, next_indices,
+            _beam_hyps=_beam_hyps,
+            _beam_scores=_beam_scores,
+            _beam_hyps_count=_beam_hyps_count,
+            _beam_hyps_worst_scores=_beam_hyps_worst_scores,
+            _done=_done,
+            pad_token_id=pad_token_id, eos_token_id=eos_token_id,
         )
 
         # if return_dict_in_generate:

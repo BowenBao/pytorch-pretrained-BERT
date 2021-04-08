@@ -44,7 +44,7 @@ torch.onnx.export(
     script_model,
     (enc['input_ids'], enc['attention_mask'], 2),
     'model.onnx',
-    opset_version=12,
+    opset_version=13,
     input_names=['input_ids', 'attention_mask', 'num_beams'],
     output_names=['tokens'],
     dynamic_axes={
@@ -54,6 +54,21 @@ torch.onnx.export(
     },
     example_outputs=tokens)
 
+print('Complete exporting to onnx.')
+
+import numpy as np
+import onnxruntime
+sess = onnxruntime.InferenceSession('model.onnx')
+
+ort_out = sess.run(None, {
+    'input_ids': enc['input_ids'].cpu().numpy(),
+    'attention_mask': enc['attention_mask'].cpu().numpy(),
+    'num_beams': np.array(2, dtype=np.long),
+})
+
+print(ort_out)
+
+print("ONNX Model: ", tokenizer.batch_decode(torch.tensor(ort_out[0])))
 
 ### t5
 
