@@ -91,7 +91,7 @@ def create_t5_encoder_decoder(model="t5-base"):
     lm_head = model.lm_head
 
     t5_encoder = T5Encoder(encoder).eval()
-    t5_decoder = T5Decoder(decoder).eval()
+    t5_decoder = T5Decoder(decoder, model.config).eval()
     t5_lm_head = T5LMHead(lm_head).eval()
     return t5_encoder, t5_decoder, t5_lm_head
 
@@ -112,7 +112,6 @@ class T5Decoder(torch.nn.Module):
         self.d_model = config.d_model
 
     def forward(self, input_ids, encoder_hidden_states, attention_mask, past_key_values: Optional[List[Tensor]]) -> Tuple[Tensor, Optional[List[Tensor]]]:
-
         decoder_output = self.decoder(
             input_ids=input_ids,
             encoder_attention_mask=attention_mask,
@@ -168,7 +167,7 @@ class MinLengthLogitsProcessorTS(torch.nn.Module):
             scores[:, self.eos_token_id] = -float("inf")
         return scores
 
-class SimplifiedGenerator(torch.nn.Module):
+class SimplifiedGenerator(torch.nn.Module, GenerationMixin):
     def __init__(self, model_name_or_path, onnx_path):
         super().__init__()
         self.device = torch.device('cpu')
@@ -186,32 +185,6 @@ class SimplifiedGenerator(torch.nn.Module):
 
         self._trace_modules()
 
-    def _get_decoder_start_token_id(self, decoder_start_token_id: int = None, bos_token_id: int = None) -> int:
-        decoder_start_token_id = (
-            decoder_start_token_id if decoder_start_token_id is not None else self.config.decoder_start_token_id
-        )
-        bos_token_id = bos_token_id if bos_token_id is not None else self.config.bos_token_id
-
-        if decoder_start_token_id is not None:
-            return decoder_start_token_id
-        elif (
-            hasattr(self.config, "decoder")
-            and hasattr(self.config.decoder, "decoder_start_token_id")
-            and self.config.decoder.decoder_start_token_id is not None
-        ):
-            return self.config.decoder.decoder_start_token_id
-        elif bos_token_id is not None:
-            return bos_token_id
-        elif (
-            hasattr(self.config, "decoder")
-            and hasattr(self.config.decoder, "bos_token_id")
-            and self.config.decoder.bos_token_id is not None
-        ):
-            return self.config.decoder.bos_token_id
-        raise ValueError(
-            "`decoder_start_token_id` or `bos_token_id` has to be defined for encoder-decoder generation."
-        )
-
     def _trace_modules(self):
         model = self.model_name_or_path.as_posix()
         simplified_encoder, decoder, lm_head = create_t5_encoder_decoder(model)
@@ -228,7 +201,7 @@ class SimplifiedGenerator(torch.nn.Module):
         decoder_input_ids = torch.zeros((input_ids.shape[0], 1), dtype=input_ids.dtype, device=input_ids.device)
         attention_mask = input_ids.new_ones(input_ids.shape)
 
-        decoder_outs = decoder(decoder_input_ids, encoder_out, attention_mask)
+        decoder_outs = decoder(decoder_input_ids, encoder_out, attention_mask, None)
         # flatten decoder outs
         if isinstance(decoder_outs, tuple):
             d = [decoder_outs[0]]
@@ -267,7 +240,7 @@ class SimplifiedGenerator(torch.nn.Module):
         last_hidden_state = self.encoder(input_ids, attention_mask)
         return last_hidden_state
 
-    def _decoder_forward(self, decoder_input_ids, attention_mask, encoder_outputs, past_key_values:Optional[List[Tensor]]) \
+    def _decoder_forward(self, decoder_input_ids, attention_mask, encoder_outputs, past_key_values:Optional[List[Tensor]]=None) \
             -> Tuple[Tensor, Optional[List[Tensor]]]:
 
         decoder_output, past = self.decoder(decoder_input_ids, encoder_outputs, attention_mask, past_key_values)

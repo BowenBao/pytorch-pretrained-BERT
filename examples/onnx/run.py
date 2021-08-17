@@ -80,6 +80,7 @@ def save_model(name, model, inputs, outputs, input_names=None, output_names=None
         (enc['input_ids'], enc['attention_mask'], 2),
         'model.onnx',
         opset_version=15,
+        verbose=True,
         input_names=['input_ids', 'attention_mask', 'num_beams'],
         output_names=['tokens'],
         dynamic_axes={
@@ -106,7 +107,7 @@ translate_str = "translate English to French: This is fantastic! One in the name
 enc = tokenizer(translate_str, return_tensors="pt")
 
 # baseline
-# enc = tokenizer(translate_str, return_tensors="pt")
+enc = tokenizer(translate_str, return_tensors="pt")
 # model = T5ForConditionalGeneration.from_pretrained('t5-small')
 # fix_pretrained_model_weight(model)
 # outputs = model.generate(input_ids=enc['input_ids'], attention_mask=enc['attention_mask'], num_beams=2, use_cache=True)
@@ -115,7 +116,7 @@ enc = tokenizer(translate_str, return_tensors="pt")
 
 # ONNX beam search baseline
 model = SimplifiedGenerator(model_name_or_path="t5-small", onnx_path="onnx_models")
-# outputs = model.generate(enc['input_ids'], enc['attention_mask'], 2)
+# outputs = model.generate(input_ids=enc['input_ids'], num_beams=2)
 # print("Simplified generator outputs:", outputs)
 # print("Simplified generator: ", tokenizer.batch_decode(outputs))
 

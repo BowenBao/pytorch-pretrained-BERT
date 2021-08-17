@@ -490,7 +490,7 @@ class T5Attention(nn.Module):
         layer_head_mask:Optional[torch.Tensor]=None,
         query_length:Optional[int]=None,
         use_cache:bool=False,
-        output_attentions:bool=False,
+        output_attentions:bool=None,
     ):
         """
         Self-attention (if key_value_states is None) or attention over source sentence (provided by key_value_states).
@@ -575,7 +575,7 @@ class T5LayerSelfAttention(nn.Module):
         layer_head_mask:Optional[torch.Tensor]=None,
         past_key_value:Optional[List[torch.Tensor]]=None,
         use_cache:bool=False,
-        output_attentions:bool=False,
+        output_attentions:bool=None,
     ) -> Tuple[Tensor, Optional[List[Tensor]], Tensor, Optional[Tensor]]:
         normed_hidden_states = self.layer_norm(hidden_states)
         attn_output, present_key_value_state, position_bias, attn_weights = self.SelfAttention(
@@ -608,7 +608,7 @@ class T5LayerCrossAttention(nn.Module):
         past_key_value:Optional[List[torch.Tensor]]=None,
         use_cache:bool=False,
         query_length:Optional[int]=None,
-        output_attentions:bool=False,
+        output_attentions:bool=None,
     ) -> Tuple[Tensor, Optional[List[Tensor]], Tensor, Optional[Tensor]]:
         normed_hidden_states = self.layer_norm(hidden_states)
         attn_output, present_key_value_state, position_bias, attn_weights = self.EncDecAttention(
@@ -633,7 +633,7 @@ class T5Block(nn.Module):
         self.layer = nn.ModuleList()
         self.layer.append(T5LayerSelfAttention(config, has_relative_attention_bias=has_relative_attention_bias))
         if self.is_decoder:
-            #config.use_cache = True
+            config.use_cache = True
             self.layer.append(T5LayerCrossAttention(config))
         self.layer.append(T5LayerFF(config))
 
@@ -830,6 +830,7 @@ class T5Stack(T5PreTrainedModel):
 
         self.embed_tokens = embed_tokens
         self.is_decoder = config.is_decoder
+        self.num_layers = config.num_layers
 
         self.block = nn.ModuleList(
             [T5Block(config, has_relative_attention_bias=bool(i == 0)) for i in range(config.num_layers)]
@@ -853,10 +854,10 @@ class T5Stack(T5PreTrainedModel):
         self.first_device = "cpu" if "cpu" in self.device_map.keys() else "cuda:" + str(min(self.device_map.keys()))
         self.last_device = "cuda:" + str(max(self.device_map.keys()))
         # Load onto devices
-        for k, v in self.device_map.items():
-            for layer in v:
-                cuda_device = "cuda:" + str(k)
-                self.block[layer] = self.block[layer].to(cuda_device)
+        # for k, v in self.device_map.items():
+        #     for layer in v:
+        #         cuda_device = "cuda:" + str(k)
+        #         self.block[layer] = self.block[layer].to(cuda_device)
 
         # Set embed_tokens to first layer
         self.embed_tokens = self.embed_tokens.to(self.first_device)
@@ -891,17 +892,17 @@ class T5Stack(T5PreTrainedModel):
         head_mask: Optional[torch.Tensor]=None,
         encoder_head_mask: Optional[torch.Tensor]=None,
         past_key_values: Optional[List[Tensor]]=None,
-        use_cache: bool=False,
-        output_attentions: bool=True,
-        output_hidden_states: bool=True,
+        use_cache: bool=None,
+        output_attentions: bool=None,
+        output_hidden_states: bool=None,
         return_dict: bool=True,
     ) -> Tuple[Tensor, Optional[List[Tensor]], Optional[List[Tensor]], Optional[List[Tensor]], Optional[List[Tensor]]]:
         # Model parallel
-
+        use_cache = False
         output_attentions = True
-        if self.model_parallel:
-            # torch.cuda.set_device(self.first_device)
-            self.embed_tokens = self.embed_tokens#.to(self.first_device)
+        # if self.model_parallel:
+        #     # torch.cuda.set_device(self.first_device)
+        #     self.embed_tokens = self.embed_tokens#.to(self.first_device)
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -961,9 +962,8 @@ class T5Stack(T5PreTrainedModel):
             encoder_extended_attention_mask = None
 
         # Prepare head mask if needed
-        # Tself.config.num_layers = 12
-        head_mask = self.get_head_mask(head_mask, 12)
-        encoder_head_mask = self.get_head_mask(encoder_head_mask, 12)
+        head_mask = self.get_head_mask(head_mask, self.num_layers)
+        encoder_head_mask = self.get_head_mask(encoder_head_mask, self.num_layers)
         present_key_value_states: Optional[List[Tensor]] = None
         all_hidden_states: Optional[List[Tensor]] = None
         if output_hidden_states:
@@ -1060,10 +1060,10 @@ class T5Stack(T5PreTrainedModel):
                         all_cross_attentions = all_cross_attentions + [layer_outputs_5]
 
             # Model Parallel: If it's the last layer for that device, put things on the next device
-            if self.model_parallel:
-                for k, v in self.device_map.items():
-                    if i == v[-1] and "cuda:" + str(k) != self.last_device:
-                        hidden_states = hidden_states.to("cuda:" + str(k + 1))
+            # if self.model_parallel:
+            #     for k, v in self.device_map.items():
+            #         if i == v[-1] and "cuda:" + str(k) != self.last_device:
+            #             hidden_states = hidden_states.to("cuda:" + str(k + 1))
 
         hidden_states = self.final_layer_norm(hidden_states)
         hidden_states = self.dropout(hidden_states)
@@ -1340,7 +1340,7 @@ class T5Model(T5PreTrainedModel):
         past_key_values=None,
         inputs_embeds=None,
         decoder_inputs_embeds=None,
-        use_cache=None,
+        use_cache=False,
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
@@ -1558,7 +1558,7 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
             >>> input_ids = tokenizer("summarize: studies have shown that owning a dog is good for you ", return_tensors="pt").input_ids  # Batch size 1
             >>> outputs = model.generate(input_ids)
         """
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        use_cache = use_cache if use_cache is not None else False
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         # FutureWarning: head_mask was separated into two input args - head_mask, decoder_head_mask
