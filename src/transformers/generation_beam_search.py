@@ -387,6 +387,16 @@ class BeamHypotheses:
 class BeamSearchScorerTS(torch.nn.Module):
     def __init__(self):
         super().__init__()
+        self.max_length = 0
+        self.num_beams = 0
+        self.batch_size = 0
+        self.length_penalty = 0.
+        self.do_early_stopping = False
+        self.num_beam_hyps_to_keep = 0
+        self.num_beam_groups = 0
+        self.group_size = 0
+        self._is_init = False
+        self._beam_hyps_max_length = 0
 
     def is_done(self, _done) -> torch.Tensor:
         return _done.all()

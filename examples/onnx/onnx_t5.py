@@ -346,7 +346,11 @@ class SimplifiedGenerator(torch.nn.Module, GenerationMixin):
         next_tokens = torch.zeros((batch_size, num_beams), dtype=torch.long, device=input_ids.device)
         next_indices = torch.zeros((batch_size, num_beams), dtype=torch.long, device=input_ids.device)
 
-        past: Optional[List[Tensor]] = None
+        past: Optional[List[Tensor]] = None #[torch.empty(2, 8, 1, 64),
+                                        #torch.empty(2, 8, 1, 64),
+                                        #torch.empty(2, 8, 1, 64),
+                                        #torch.empty(2, 8, 1, 64)] * 12
+
         while cur_len < max_length:
             decoder_input_ids = input_ids
             past_key_values = past
@@ -368,7 +372,7 @@ class SimplifiedGenerator(torch.nn.Module, GenerationMixin):
             next_token_scores = next_token_scores + beam_scores[:, None].expand_as(next_token_scores)
 
             # reshape for beam search
-            vocab_size = next_token_scores.shape[-1]
+            vocab_size = torch.tensor(next_token_scores.shape[-1], dtype=torch.long)
             next_token_scores = next_token_scores.view(batch_size, num_beams * vocab_size)
 
             next_token_scores, next_tokens = torch.topk(

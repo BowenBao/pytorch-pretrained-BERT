@@ -668,7 +668,6 @@ class T5Block(nn.Module):
             cross_attn_past_key_value = past_key_value[2:]
         else:
             self_attn_past_key_value, cross_attn_past_key_value = None, None
-
         self_attention_outputs = self.layer[0](
             hidden_states,
             attention_mask=attention_mask,
@@ -935,7 +934,7 @@ class T5Stack(T5PreTrainedModel):
         if past_key_values is not None:
             past_key_values_0 = past_key_values[0]
             assert past_key_values_0 is not None
-            mask_seq_length = past_key_values_0.shape[2] + seq_length
+            mask_seq_length = past_key_values_0.shape[2] #+ seq_length
         else:
             mask_seq_length = seq_length
 

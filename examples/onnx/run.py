@@ -79,7 +79,7 @@ def save_model(name, model, inputs, outputs, input_names=None, output_names=None
         model,
         (enc['input_ids'], enc['attention_mask'], 2),
         'model.onnx',
-        opset_version=15,
+        opset_version=16,
         verbose=True,
         input_names=['input_ids', 'attention_mask', 'num_beams'],
         output_names=['tokens'],
