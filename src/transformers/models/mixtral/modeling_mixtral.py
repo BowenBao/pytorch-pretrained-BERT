@@ -685,6 +685,79 @@ MISTRAL_ATTENTION_CLASSES = {
 }
 
 
+class MoEBlockForOnnxExport(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        hidden_states,
+        router_logits,
+        batch_size,
+        sequence_length,
+        hidden_dim,
+        top_k,
+        num_experts,
+        hidden_act,
+        expert_weights_1,
+        expert_weights_2,
+        expert_weights_3
+    ):
+        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+
+        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        # we cast back to the input dtype
+        routing_weights = routing_weights.to(hidden_states.dtype)
+
+        final_hidden_states = torch.zeros(
+            (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
+        )
+
+        # One hot encode the selected experts to create an expert mask
+        # this will be used to easily index which expert is going to be sollicitated
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
+
+        # Loop over all available experts in the model and perform the computation on each expert
+        for expert_idx in range(num_experts):
+
+            # NOTE(bowbao): A little bit of rewrite from nn.Linear to nn.functional.linear
+            # expert_layer = self.experts[expert_idx]
+            expert_weight_1 = expert_weights_1[expert_idx]
+            expert_weight_2 = expert_weights_2[expert_idx]
+            expert_weight_3 = expert_weights_3[expert_idx]
+            idx, top_x = torch.where(expert_mask[expert_idx])
+
+            if top_x.shape[0] == 0:
+                continue
+
+            # in torch it is faster to index using lists than torch tensors
+            top_x_list = top_x.tolist()
+            idx_list = idx.tolist()
+
+            # Index the correct hidden states and compute the expert hidden state for
+            # the current expert. We need to make sure to multiply the output hidden
+            # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
+            current_state = hidden_states[None, top_x_list].reshape(-1, hidden_dim)
+            # NOTE(bowbao): cont - rewrite nn.Linear with nn.functional.linear
+            # current_hidden_states = expert_layer(current_state) * routing_weights[top_x_list, idx_list, None]
+            expert_layer_out = torch.nn.functional.linear(current_state, expert_weight_1)
+            expert_layer_out = ACT2FN[hidden_act](expert_layer_out)
+            expert_layer_out = expert_layer_out * torch.nn.functional.linear(current_state, expert_weight_3)
+            expert_layer_out = torch.nn.functional.linear(expert_layer_out, expert_weight_2)
+            
+            current_hidden_states = expert_layer_out * routing_weights[top_x_list, idx_list, None]
+
+            # However `index_add_` only support torch tensors for indexing so we'll use
+            # the `top_x` tensor here.
+            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+        final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+        return final_hidden_states
+
+    @staticmethod
+    def symbolic(g: torch.Graph, hidden_states, router_logits, batch_size, sequence_length, hidden_dim, top_k, num_experts, hidden_act, expert_weights_1, expert_weights_2, expert_weights_3):
+        final_hidden_states = g.op("com.microsoft::MoE", hidden_states, router_logits, expert_weights_1, expert_weights_2, expert_weights_3)
+        final_hidden_states.setType(hidden_states.type())
+        return final_hidden_states
+
 class MixtralSparseMoeBlock(nn.Module):
     """
     This implementation is
@@ -709,6 +782,8 @@ class MixtralSparseMoeBlock(nn.Module):
 
         self.experts = nn.ModuleList([MixtralBLockSparseTop2MLP(config) for _ in range(self.num_experts)])
 
+        self.hidden_act = config.hidden_act
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """ """
         batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -716,8 +791,27 @@ class MixtralSparseMoeBlock(nn.Module):
         # router_logits: (batch * sequence_length, n_experts)
         router_logits = self.gate(hidden_states)
 
+        if torch.onnx.is_in_onnx_export():
+            # NOTE(bowbao): Alternatively, the interface can be cleaned up to avoid passing the scalar values such as
+            # batch_size, etc. These are not used in onnx contrib op, and are only used in autograd.Function.forward
+            # to provide parity with the original MoE implementation.
+            return MoEBlockForOnnxExport.apply(
+                hidden_states,
+                router_logits,
+                batch_size,
+                sequence_length,
+                hidden_dim,
+                self.top_k,
+                self.num_experts,
+                self.hidden_act,
+                torch.stack([expert.w1.weight for expert in self.experts]),
+                torch.stack([expert.w2.weight for expert in self.experts]),
+                torch.stack([expert.w3.weight for expert in self.experts]),
+            ), router_logits
+
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
         routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+
         routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
         # we cast back to the input dtype
         routing_weights = routing_weights.to(hidden_states.dtype)
