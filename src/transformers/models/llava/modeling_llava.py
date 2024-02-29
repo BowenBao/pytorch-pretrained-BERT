@@ -477,7 +477,10 @@ class LlavaForConditionalGeneration(LlavaPreTrainedModel):
             return_dict=return_dict,
         )
 
-        logits = outputs[0]
+        if return_dict:
+            logits = outputs.logits
+        else:
+            logits = outputs[0]
 
         loss = None
         if labels is not None:
